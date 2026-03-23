@@ -73,7 +73,6 @@ def extract(
     user_prompt: str,
     schema: type[T],
     model: str,
-    prompt_file: str = "",
     cache: LLMCache,
     client: Any,
     reextract: bool = False,
@@ -96,8 +95,6 @@ def extract(
         Pydantic model to validate the LLM output against.
     model : str
         LLM model name (e.g. "gpt-4o-mini").
-    prompt_file : str
-        Name of the prompt file (for metadata, e.g. "irregularity_system.txt").
     cache : LLMCache
         Cache instance.
     client : openai.OpenAI
@@ -137,12 +134,13 @@ def extract(
             )
 
     # ── Call LLM ─────────────────────────────────────────────────────
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=messages,
         response_format={"type": "json_object"},
         temperature=temperature,
         max_tokens=max_tokens,
@@ -166,9 +164,7 @@ def extract(
         raw,
         doc_id=doc_id,
         text_hash=t_hash,
-        n_chars=len(text),
-        input_text=text,
-        prompt_file=prompt_file,
+        messages=messages,
         prompt_hash=p_hash,
         model=model,
         model_version=model_version,

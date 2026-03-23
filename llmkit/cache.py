@@ -64,7 +64,7 @@ class CacheEntry:
     doc_id: str
     extraction: dict
     meta: dict = field(default_factory=dict)
-    input_text: str = ""
+    messages: list[dict] = field(default_factory=list)
     path: Path | None = None
 
     @property
@@ -103,8 +103,6 @@ class LLMCache:
           "_cache_meta": {
             "doc_id": "...",
             "text_hash": "...",
-            "n_chars": 22666,
-            "prompt_file": "irregularity_system.txt",
             "prompt_hash": "a3b4c5d6e7f8a9b0",
             "model": "gpt-4o-mini",
             "model_version": "gpt-4o-mini-2024-07-18",
@@ -119,7 +117,10 @@ class LLMCache:
             "usage": {...},
             "api_params": {"response_format": "json_object", "top_p": 1}
           },
-          "input_text": "... full document text ...",
+          "messages": [
+            {"role": "system", "content": "..."},
+            {"role": "user", "content": "..."}
+          ],
           "extraction": { ... raw LLM output ... }
         }
     """
@@ -159,18 +160,18 @@ class LLMCache:
         if "_cache_meta" in data:
             meta = data["_cache_meta"]
             extraction = data.get("extraction", data)
-            input_text = data.get("input_text", "")
+            messages = data.get("messages", [])
         else:
             # Old format: entire file is the extraction
             meta = {}
             extraction = data
-            input_text = ""
+            messages = []
         return CacheEntry(
             key=key,
             doc_id=meta.get("doc_id", key),
             extraction=extraction,
             meta=meta,
-            input_text=input_text,
+            messages=messages,
             path=p,
         )
 
@@ -183,9 +184,7 @@ class LLMCache:
         *,
         doc_id: str = "",
         text_hash: str = "",
-        n_chars: int = 0,
-        input_text: str = "",
-        prompt_file: str = "",
+        messages: list[dict] | None = None,
         prompt_hash: str = "",
         model: str = "",
         model_version: str = "",
@@ -208,8 +207,6 @@ class LLMCache:
             "_cache_meta": {
                 "doc_id": doc_id,
                 "text_hash": text_hash,
-                "n_chars": n_chars,
-                "prompt_file": prompt_file,
                 "prompt_hash": prompt_hash,
                 "model": model,
                 "model_version": model_version,
@@ -224,7 +221,7 @@ class LLMCache:
                 "usage": usage or {},
                 "api_params": api_params or {},
             },
-            "input_text": input_text,
+            "messages": messages or [],
             "extraction": extraction,
         }
         with open(p, "w") as f:
