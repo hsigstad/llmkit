@@ -76,8 +76,8 @@ Part of a set of repositories I use across my research projects:
 - [research-kit](https://github.com/hsigstad/research-kit) — Claude Code
   skills, conventions, methodology docs, tools (includes the `/llmkit`
   skill that documents conventional usage)
-- [diarios](https://github.com/hsigstad/diarios) — Brazilian
-  official-diary parsing
+- [diarios](https://github.com/hsigstad/diarios) — toolkit for
+  Brazilian court and administrative data
 - [newsbr](https://github.com/hsigstad/newsbr) — Brazilian news collection
 - [brazil-institutions](https://github.com/hsigstad/brazil-institutions) —
   institutional reference for Brazil-focused research
