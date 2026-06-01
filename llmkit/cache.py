@@ -39,9 +39,21 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def _cache_key(doc_id: str, text_hash: str, model: str) -> str:
-    """Deterministic cache key — only content + model, not prompt version."""
-    raw = f"{doc_id}|{text_hash}|{model}"
+def _cache_key(
+    doc_id: str,
+    text_hash: str,
+    model: str,
+    schema_name: str = "",
+) -> str:
+    """Deterministic cache key — content + model + (optional) schema_name.
+
+    schema_name is opt-in for backwards compatibility: callers that omit it
+    get the historical key, so existing caches stay valid. New extraction
+    tasks should pass schema_name so that multiple tasks against the same
+    (doc_id, text) on the same model do not collide.
+    """
+    raw = (f"{doc_id}|{text_hash}|{model}|{schema_name}"
+           if schema_name else f"{doc_id}|{text_hash}|{model}")
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -135,8 +147,18 @@ class LLMCache:
         return text_hash(text)
 
     @staticmethod
-    def key(doc_id: str, text_hash: str, model: str) -> str:
-        return _cache_key(doc_id, text_hash, model)
+    def key(
+        doc_id: str,
+        text_hash: str,
+        model: str,
+        *,
+        schema_name: str = "",
+    ) -> str:
+        """Composite cache key. ``schema_name`` is optional; omit it for
+        the historical key (used by existing caches without schema-aware
+        keys), pass it on new extraction tasks to avoid cross-task
+        collisions on the same document."""
+        return _cache_key(doc_id, text_hash, model, schema_name=schema_name)
 
     # ── Read ─────────────────────────────────────────────────────────
 
@@ -247,3 +269,15 @@ class LLMCache:
         if not self.directory.exists():
             return 0
         return sum(1 for _ in self.directory.glob("*.json"))
+
+    def __bool__(self) -> bool:
+        """LLMCache instances are always truthy.
+
+        Without this, Python falls back to ``__len__`` for truthiness —
+        so an empty cache (zero files) reads as falsy. Common idiom
+        ``c = passed_cache or DEFAULT_CACHE`` then silently substitutes
+        the default whenever the caller passes a fresh, empty cache.
+        That bug is hard to spot. Explicit ``True`` here makes the
+        idiom safe.
+        """
+        return True

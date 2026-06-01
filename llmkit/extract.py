@@ -1,8 +1,22 @@
 """Core extraction: call LLM, validate with Pydantic, cache result.
 
-Cache key is (doc_id, text_hash, model) — prompt changes do NOT invalidate
-cache.  Use ``reextract=True`` to force re-extraction of stale entries
-(different prompt or data since cached).
+Cache key is (doc_id, text_hash, model[, schema_name]) — prompt changes do
+NOT invalidate cache.  Use ``reextract=True`` to force re-extraction of
+stale entries (different prompt or data since cached).
+
+Two LLM-call modes are supported:
+
+* Legacy ``json_object`` mode (default).  ``response_format`` is set to
+  ``{"type": "json_object"}``.  The model returns a JSON document but the
+  shape is enforced only by the prompt — typically the system prompt has
+  to spell out the field names and the literal word "json" must appear in
+  the messages.  Pydantic validation happens client-side after the call.
+* Structured Outputs (``use_structured_outputs=True``).  ``response_format``
+  is set to the Pydantic schema and the call uses
+  ``client.chat.completions.parse``, so OpenAI enforces the schema
+  server-side via constrained decoding.  No JSON-keyword requirement on
+  the prompt and no field-name drift.  Available on ``gpt-4o``,
+  ``gpt-4o-mini``, ``gpt-4.1``, and o-series models.
 
 Usage:
     from llmkit import extract, LLMCache
@@ -15,9 +29,10 @@ Usage:
         user_prompt="...",
         schema=MySchema,
         model="gpt-4o-mini",
-        prompt_file="irregularity_system.txt",
         cache=LLMCache(Path("cache_dir")),
         client=openai_client,
+        use_structured_outputs=True,   # opt-in to schema enforcement
+        schema_in_cache_key=True,      # opt-in to schema-aware cache key
     )
     if result.valid:
         print(result.parsed.some_field)
@@ -65,6 +80,87 @@ class ExtractionResult:
     usage: dict = field(default_factory=dict)
 
 
+def _schema_name(schema: type[BaseModel]) -> str:
+    return getattr(schema, "schema_name", "") or ""
+
+
+def _call_legacy_json_mode(
+    *,
+    client: Any,
+    model: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+) -> tuple[dict, dict, str, str, dict]:
+    """Legacy JSON-mode call. Returns (raw, usage, finish_reason,
+    model_version, api_params)."""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    content = response.choices[0].message.content
+    raw = json.loads(content)
+    usage = {
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+    }
+    finish_reason = response.choices[0].finish_reason or ""
+    model_version = response.model or ""
+    api_params = {"response_format": "json_object", "top_p": 1}
+    return raw, usage, finish_reason, model_version, api_params
+
+
+def _call_structured_outputs(
+    *,
+    client: Any,
+    model: str,
+    messages: list[dict],
+    schema: type[BaseModel],
+    temperature: float,
+    max_tokens: int,
+) -> tuple[dict, dict, str, str, dict]:
+    """Structured-Outputs call (schema enforced server-side). Returns
+    (raw, usage, finish_reason, model_version, api_params). The 'raw'
+    dict is the Pydantic-instance's model_dump() — i.e. already
+    schema-conformant, but we still feed it through ``_validate()``
+    downstream as defense-in-depth (and to handle refusals)."""
+    response = client.chat.completions.parse(
+        model=model,
+        messages=messages,
+        response_format=schema,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    choice = response.choices[0]
+    msg = choice.message
+    usage = {
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+    }
+    finish_reason = choice.finish_reason or ""
+    model_version = response.model or ""
+    api_params = {
+        "response_format": "structured_outputs",
+        "schema_name": _schema_name(schema),
+        "top_p": 1,
+    }
+    # Refusal path: server declined to answer for safety reasons.
+    if getattr(msg, "refusal", None):
+        api_params["refusal"] = msg.refusal
+        return {}, usage, finish_reason, model_version, api_params
+    parsed = getattr(msg, "parsed", None)
+    if parsed is not None:
+        raw = parsed.model_dump()
+    else:
+        # Fallback: parsed missing (shouldn't happen on the happy path),
+        # decode the raw content if any.
+        raw = json.loads(msg.content) if msg.content else {}
+    return raw, usage, finish_reason, model_version, api_params
+
+
 def extract(
     *,
     doc_id: str,
@@ -78,6 +174,8 @@ def extract(
     reextract: bool = False,
     temperature: float = 0,
     max_tokens: int = 4000,
+    use_structured_outputs: bool = False,
+    schema_in_cache_key: bool = False,
 ) -> ExtractionResult:
     """Extract structured data from text via LLM.
 
@@ -106,14 +204,24 @@ def extract(
         LLM temperature (default 0).
     max_tokens : int
         Max completion tokens.
+    use_structured_outputs : bool
+        If True, call ``client.chat.completions.parse(response_format=schema)``
+        so the schema is enforced server-side.  Requires a model that
+        supports Structured Outputs (gpt-4o / gpt-4o-mini / gpt-4.1 /
+        o-series).  Default False to preserve historical behavior for
+        existing callers.
+    schema_in_cache_key : bool
+        If True, the schema's ``schema_name`` is mixed into the composite
+        cache key, preventing cross-task collisions when multiple
+        extraction tasks share a cache directory.  Default False to keep
+        existing caches valid; new callers should set this True.
     """
     t_hash = text_hash(text)
     p_hash = content_hash(system_prompt)
-    key = cache.key(doc_id, t_hash, model)
-
-    # Read schema identity if available (from ExtractionSchema subclass)
-    s_name = getattr(schema, "schema_name", "") or ""
+    s_name = _schema_name(schema)
     s_version = getattr(schema, "schema_version", "") or ""
+    key_schema = s_name if schema_in_cache_key else ""
+    key = cache.key(doc_id, t_hash, model, schema_name=key_schema)
 
     # ── Check cache ──────────────────────────────────────────────────
     hit = cache.get(key)
@@ -138,22 +246,19 @@ def extract(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    content = response.choices[0].message.content
-    raw = json.loads(content)
-    usage = {
-        "prompt_tokens": response.usage.prompt_tokens,
-        "completion_tokens": response.usage.completion_tokens,
-    }
-    finish_reason = response.choices[0].finish_reason or ""
-    # The API returns the actual model version used (e.g. "gpt-4o-mini-2024-07-18")
-    model_version = response.model or ""
+    if use_structured_outputs:
+        raw, usage, finish_reason, model_version, api_params = \
+            _call_structured_outputs(
+                client=client, model=model, messages=messages,
+                schema=schema, temperature=temperature,
+                max_tokens=max_tokens,
+            )
+    else:
+        raw, usage, finish_reason, model_version, api_params = \
+            _call_legacy_json_mode(
+                client=client, model=model, messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+            )
 
     # ── Validate ─────────────────────────────────────────────────────
     parsed, valid, errors = _validate(raw, schema)
@@ -175,10 +280,7 @@ def extract(
         schema_version=s_version,
         validation_status="valid" if valid else "invalid",
         usage=usage,
-        api_params={
-            "response_format": "json_object",
-            "top_p": 1,
-        },
+        api_params=api_params,
     )
 
     return ExtractionResult(
