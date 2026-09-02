@@ -84,6 +84,24 @@ def _schema_name(schema: type[BaseModel]) -> str:
     return getattr(schema, "schema_name", "") or ""
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Reasoning models (gpt-5 family, o-series) reject `temperature` != default
+    and `max_tokens`; they require `max_completion_tokens` and no temperature
+    override. `gpt-5-chat*` is a standard chat model and is NOT reasoning."""
+    m = model.lower()
+    if "chat" in m:
+        return False
+    return m.startswith(("o1", "o3", "o4")) or m.startswith("gpt-5")
+
+
+def _sampling_kwargs(model: str, temperature: float, max_tokens: int) -> dict:
+    """Per-family sampling kwargs. Reasoning models take `max_completion_tokens`
+    and no `temperature`; standard chat models take `temperature` + `max_tokens`."""
+    if _is_reasoning_model(model):
+        return {"max_completion_tokens": max_tokens}
+    return {"temperature": temperature, "max_tokens": max_tokens}
+
+
 def _call_legacy_json_mode(
     *,
     client: Any,
@@ -98,8 +116,7 @@ def _call_legacy_json_mode(
         model=model,
         messages=messages,
         response_format={"type": "json_object"},
-        temperature=temperature,
-        max_tokens=max_tokens,
+        **_sampling_kwargs(model, temperature, max_tokens),
     )
     content = response.choices[0].message.content
     raw = json.loads(content)
@@ -109,7 +126,8 @@ def _call_legacy_json_mode(
     }
     finish_reason = response.choices[0].finish_reason or ""
     model_version = response.model or ""
-    api_params = {"response_format": "json_object", "top_p": 1}
+    api_params = {"response_format": "json_object", "top_p": 1,
+                  "reasoning_model": _is_reasoning_model(model)}
     return raw, usage, finish_reason, model_version, api_params
 
 
@@ -131,8 +149,7 @@ def _call_structured_outputs(
         model=model,
         messages=messages,
         response_format=schema,
-        temperature=temperature,
-        max_tokens=max_tokens,
+        **_sampling_kwargs(model, temperature, max_tokens),
     )
     choice = response.choices[0]
     msg = choice.message
@@ -146,6 +163,7 @@ def _call_structured_outputs(
         "response_format": "structured_outputs",
         "schema_name": _schema_name(schema),
         "top_p": 1,
+        "reasoning_model": _is_reasoning_model(model),
     }
     # Refusal path: server declined to answer for safety reasons.
     if getattr(msg, "refusal", None):
